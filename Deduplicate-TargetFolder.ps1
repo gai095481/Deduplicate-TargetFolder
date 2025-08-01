@@ -1,5 +1,4 @@
 # --- Script: Deduplicate-TargetFolder.ps1 ---
-# DEFECT: Crashed when it tries to process over 500 files to the Recycling Bin.
 
 param(
     [Parameter(Mandatory = $true)]
@@ -275,85 +274,96 @@ if ($DryRun) {
         Write-Host "`nMoving identified target folder duplicate files to Recycle Bin..."
         $MovedFilesCount = 0
         $ErrorCount = 0
-        $CurrentFileIndex = 0
         $TotalFiles = $TargetFilesToProcess.Count
+        $BatchSize = 100 # Define the batch size (can keep this for progress reporting even if not for COM delay)
+        $UseVBMethod = $true # Flag to indicate which method is being used
 
-        foreach ($FileToRemove in $TargetFilesToProcess) {
-             $CurrentFileIndex++
-             $FilePath = $FileToRemove.path
-             Write-Host "[$CurrentFileIndex/$TotalFiles] Attempting to move: $FilePath"
-             # Initialize COM objects as $null for this iteration
-             $Shell = $null
-             $Item = $null
-             try {
-                 # Move to Recycle Bin using Shell.Application COM object
-                 $Shell = New-Object -ComObject Shell.Application
-                 $Item = $Shell.Namespace(0).ParseName($FilePath)
-                 if ($Item) {
-                     $Item.InvokeVerb('delete') # This moves to Recycle Bin
-                     Write-Host "  -> Success" # Indicate success
-                     $MovedFilesCount++
-                 } else {
-                     Write-Warning "Could not find item in shell namespace to delete: $FilePath"
-                     $ErrorCount++
-                 }
-
-                 # Explicitly release COM objects
-                 if ($Item) {
-                     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Item) | Out-Null
-                     $Item = $null # Set to null after releasing
-                 }
-                 if ($Shell) {
-                     [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Shell) | Out-Null
-                     $Shell = $null # Set to null after releasing
-                 }
-
-                 # Add a very brief delay to reduce stress on the Shell COM object
-                 Start-Sleep -Milliseconds 5
-
-             } catch [System.Runtime.InteropServices.COMException] {
-                 # Catch specific COM exceptions (including potential ACCESS_VIOLATION)
-                 Write-Error "[$CurrentFileIndex/$TotalFiles] COM Error moving file '$FilePath'. Error: $($_.Exception.Message) (HRESULT: $($_.Exception.HResult))" -ErrorAction Continue
-                 $ErrorCount++
-                 # Ensure COM objects are released even if an error occurred
-                 if ($Item) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Item) | Out-Null }
-                 if ($Shell) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Shell) | Out-Null }
-             } catch [System.UnauthorizedAccessException] {
-                 # Catch permission errors
-                 Write-Error "[$CurrentFileIndex/$TotalFiles] Access denied moving file '$FilePath'. Error: $($_.Exception.Message)" -ErrorAction Continue
-                 $ErrorCount++
-                 # Ensure COM objects are released even if an error occurred
-                 if ($Item) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Item) | Out-Null }
-                 if ($Shell) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Shell) | Out-Null }
-             } catch [System.IO.IOException] {
-                 # Catch file system errors (e.g., file in use)
-                 Write-Error "[$CurrentFileIndex/$TotalFiles] IO Error moving file '$FilePath'. Error: $($_.Exception.Message)" -ErrorAction Continue
-                 $ErrorCount++
-                 # Ensure COM objects are released even if an error occurred
-                 if ($Item) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Item) | Out-Null }
-                 if ($Shell) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Shell) | Out-Null }
-             } catch {
-                 # Catch any other unexpected errors
-                 Write-Error "[$CurrentFileIndex/$TotalFiles] Unexpected error moving file '$FilePath'. Error: $_" -ErrorAction Continue
-                 $ErrorCount++
-                 # Ensure COM objects are released even if an unexpected error occurred
-                 if ($Item) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Item) | Out-Null }
-                 if ($Shell) { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Shell) | Out-Null }
-             } finally {
-                 # Final safeguard to release COM objects if not already done in catch blocks
-                 # Note: In normal flow, they should be released in the try block.
-                 # This handles cases where an error bypassed the specific catches but objects were created.
-                 if ($Item -ne $null) {
-                     try { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Item) | Out-Null } catch { Write-Debug "Failed to release Item COM object in Finally block." }
-                 }
-                 if ($Shell -ne $null) {
-                     try { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($Shell) | Out-Null } catch { Write-Debug "Failed to release Shell COM object in Finally block." }
-                 }
-             }
+        # --- CHANGE 1: Load VisualBasic Assembly ---
+        try {
+            Add-Type -AssemblyName "Microsoft.VisualBasic" -ErrorAction Stop
+            Write-Host "Using .NET Microsoft.VisualBasic method for Recycle Bin operation." -ForegroundColor Green
+        } catch {
+            Write-Warning "Failed to load 'Microsoft.VisualBasic' assembly. Error: $_"
+            Write-Host "Falling back to permanent file deletion using [System.IO.File]::Delete()" -ForegroundColor Yellow
+            try {
+                Add-Type -AssemblyName "System.IO" -ErrorAction Stop # Usually core, but good to ensure
+            } catch {
+                Write-Error "Failed to ensure 'System.IO' is available. Cannot proceed. Error: $_"
+                exit 1
+            }
+            $UseVBMethod = $false
         }
+        # --- END CHANGE 1 ---
+
+        # --- CHANGE 2: Process files (in batches for progress, but not for COM delay) ---
+        for ($i = 0; $i -lt $TotalFiles; $i += $BatchSize) {
+            # Calculate the end index for this batch (mainly for progress display)
+            $endIndex = [Math]::Min(($i + $BatchSize - 1), ($TotalFiles - 1))
+            # Extract the current batch (for progress display)
+            $CurrentBatch = $TargetFilesToProcess[$i..$endIndex]
+            $BatchNumber = [Math]::Floor($i / $BatchSize) + 1
+            $FilesInBatch = $CurrentBatch.Count
+
+            Write-Host "`n--- Processing Batch $BatchNumber (Files $($i+1) to $($endIndex+1) of $TotalFiles) ---"
+
+            # Process each file in the current "batch"
+            $BatchIndex = 0
+            foreach ($FileToRemove in $CurrentBatch) {
+                $BatchIndex++
+                $GlobalIndex = $i + $BatchIndex
+                $FilePath = $FileToRemove.path
+                Write-Host "[$GlobalIndex/$TotalFiles] [Batch $BatchNumber - Item $BatchIndex/$FilesInBatch] Attempting to move: $FilePath"
+
+                try {
+                    if ($UseVBMethod) {
+                        # --- CHANGE 3: Use .NET VisualBasic Method ---
+                        # UIOption: OnlyErrorDialogs means no confirmation, just error dialogs if it fails.
+                        # RecycleOption: SendToRecycleBin
+                        # UICancelOption: DoNothing means if UI pops up (it shouldn't), cancel is ignored.
+                        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($FilePath, 'OnlyErrorDialogs', 'SendToRecycleBin', 'DoNothing')
+                        # --- END CHANGE 3 ---
+                    } else {
+                        # Fallback: Permanent deletion using .NET
+                        [System.IO.File]::Delete($FilePath)
+                    }
+                    Write-Host "  -> Success"
+                    $MovedFilesCount++
+
+                    # Optional: Very small delay between files if needed even with .NET method
+                    # Start-Sleep -Milliseconds 10
+
+                } catch [System.UnauthorizedAccessException] {
+                    Write-Error "[$GlobalIndex/$TotalFiles] [Batch $BatchNumber - Item $BatchIndex/$FilesInBatch] Access denied moving '$FilePath'. Error: $($_.Exception.Message)" -ErrorAction Continue
+                    $ErrorCount++
+                } catch [System.IO.IOException] {
+                    # This includes file-in-use errors
+                    Write-Error "[$GlobalIndex/$TotalFiles] [Batch $BatchNumber - Item $BatchIndex/$FilesInBatch] IO Error moving '$FilePath'. It might be in use. Error: $($_.Exception.Message)" -ErrorAction Continue
+                    $ErrorCount++
+                } catch [System.Management.Automation.MethodInvocationException] {
+                    # Catch errors specifically from the .NET VB method call
+                    Write-Error "[$GlobalIndex/$TotalFiles] [Batch $BatchNumber - Item $BatchIndex/$FilesInBatch] Error calling VB DeleteFile for '$FilePath'. Error: $($_.Exception.InnerException.Message)" -ErrorAction Continue
+                    $ErrorCount++
+                } catch {
+                    Write-Error "[$GlobalIndex/$TotalFiles] [Batch $BatchNumber - Item $BatchIndex/$FilesInBatch] Unexpected error moving '$FilePath'. Error: $_" -ErrorAction Continue
+                    $ErrorCount++
+                }
+            } # End of foreach file in current "batch"
+
+            # Optional: Delay between "batches" if needed, even with .NET method
+            # (This is now just a pause between groups of progress messages, not for COM stability)
+            if (($i + $BatchSize) -lt $TotalFiles) {
+                 Write-Host "[Batch $BatchNumber finished. Brief pause before next group...]"
+                 Start-Sleep -Milliseconds 1000 # Adjust as needed
+            }
+
+        } # End of for loop iterating through "batches"
+        # --- END CHANGE 2 ---
+
+
         # --- 9. Report Results (Normal Mode) ---
+        $MethodUsed = if ($UseVBMethod) { "moved to Recycle Bin (via .NET VB)" } else { "permanently deleted (fallback)" }
         Write-Host "`n--- Deduplication Summary ---"
-        Write-Host "Files moved to Recycle Bin: $MovedFilesCount"
+        Write-Host "Files ${MethodUsed}: $MovedFilesCount" # --- CORRECTED LINE ---
         if ($ErrorCount -gt 0) {
             Write-Warning "Errors encountered: $ErrorCount"
         }
