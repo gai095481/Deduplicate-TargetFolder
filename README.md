@@ -60,6 +60,11 @@ Open a PowerShell terminal, navigate to the directory containing the script, and
     ```powershell
     .\Deduplicate-TargetFolder.ps1 -ReferenceFolderPath "C:\Path\To\Reference" -TargetFolderPath "C:\Path\To\Target" -OutputJsonFile "my_results.json"
     ```
+4. **Recycle Empty Folders Left Behind by `Deduplicate-TargetFolder.ps1`:**
+    ```powershell
+    .\Recycle-EmptyFolders.ps1 -TargetFolderPath "C:\Path\To\Target" -DryRun
+    .\Recycle-EmptyFolders.ps1 -TargetFolderPath "C:\Path\To\Target"
+    ```
 
 ## How It Works Internally
 
